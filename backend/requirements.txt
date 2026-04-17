@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+docling
+langgraph
+langchain-community
+weasyprint
+pydantic
+python-dotenv
+httpx
+python-multipart
+python-docx

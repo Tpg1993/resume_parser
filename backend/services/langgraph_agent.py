@@ -1,0 +1,256 @@
+import os
+import json
+import httpx
+from typing import List, Dict, Any
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class AgentState(TypedDict):
+    parsed_markdown: str
+    job_description: str
+    company_name: str
+    hiring_manager: str
+    cover_letter: str
+    cover_letter_data: dict
+    suggestions: List[Dict[str, Any]]
+    status: str
+    error: str
+
+async def call_sarvam_ai(prompt: str, temperature: float = 0.2) -> str:
+    """
+    Helper function to interface with Sarvam AI's LLM endpoints.
+    Adjust the URL and payload depending on the specific Sarvam AI model wrapper you use.
+    """
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key or api_key == "your_sarvam_api_key_here":
+        raise ValueError("SARVAM_API_KEY is missing or invalid in .env")
+
+    # Sarvam AI uses an OpenAI-compatible /chat/completions endpoint
+    url = "https://api.sarvam.ai/v1/chat/completions" 
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}" 
+    }
+    
+    payload = {
+        "model": "sarvam-30b", 
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": 4000
+    }
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Robustly extract the generated text based on common LLM API schemas
+            extracted_text = None
+            if "choices" in data and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                if isinstance(choice, dict) and "message" in choice:
+                    msg = choice["message"]
+                    extracted_text = msg.get("content") or msg.get("text")
+                    if not extracted_text:
+                        # Fallback: grab any long string inside message
+                        for k, v in msg.items():
+                            if isinstance(v, str) and len(v) > 5 and k not in ["role"]:
+                                extracted_text = v
+                                break
+                elif isinstance(choice, dict) and "text" in choice:
+                    extracted_text = choice["text"]
+                elif isinstance(choice, str):
+                    extracted_text = choice
+                    
+            if not extracted_text:
+                if "output" in data:
+                    extracted_text = data["output"]
+                elif "text" in data:
+                    extracted_text = data["text"]
+                elif "results" in data and len(data["results"]) > 0:
+                    val = data["results"][0]
+                    extracted_text = val.get("text") if isinstance(val, dict) else str(val)
+                
+            if not extracted_text:
+                print(f"[DEBUG - call_sarvam_ai] LLM returned empty extraction. Raw JSON: {json.dumps(data, indent=2)}")
+                
+            return extracted_text 
+        except Exception as e:
+            raise Exception(f"Failed to communicate with Sarvam AI: {str(e)}")
+
+async def analyze_node(state: AgentState) -> AgentState:
+    """
+    The main analysis node in our acyclic/cyclic graph.
+    """
+    prompt = f"""
+    You are an expert ATS-friendly Resume Writer.
+    
+    JOB DESCRIPTION:
+    {state['job_description']}
+    
+    CURRENT RESUME (Markdown):
+    {state['parsed_markdown']}
+    
+    Suggest specific modifications to tailor this resume to the JD.
+    Output your suggestions strictly in a JSON list format where each object has:
+    - "section": The section of the resume (e.g. Experience, Skills)
+    - "original": The exact original text to replace (or null if new addition)
+    - "suggested": The proposed new text
+    - "reasoning": Why this change helps match the JD
+    
+    CRITICAL RULES:
+    1. Output strictly valid JSON.
+    2. Respond with ONLY the raw JSON list, starting with [ and ending with ].  
+    3. Do not place markdown blocks inside the JSON fields.
+    4. Ensure string values avoid unescaped inline newlines when possible. Use \\n.
+    5. If the inputs lack clear sections or are arbitrary text, try your best to logically group them into a single recommendation or return a single JSON object explaining that no clear changes could be correlated.
+    6. MAXIMUM 5 SUGGESTIONS TOTAL. Be extremely concise. Do not exceed this limit under any circumstances.
+    """
+    
+    try:
+        response_text = await call_sarvam_ai(prompt)
+        
+        if not response_text:
+            # Fallback instead of throwing an error so the frontend doesn't break
+            response_text = '[{"section": "API Issue", "original": null, "suggested": "No text generated by the AI.", "reasoning": "The AI model returned an empty response. This often happens if the input triggers a context size limit or safety filter."}]'
+            
+        # Clean response and try parsing JSON
+        clean_text = str(response_text)
+        if "```json" in clean_text:
+            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_text:
+            clean_text = clean_text.split("```")[1].strip()
+        
+        # Try to substring to '[' and ']' just in case there are conversational prefixes.
+        start = clean_text.find('[')
+        end = clean_text.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            clean_text = clean_text[start:end+1]
+        else:
+            clean_text = clean_text.strip()
+            
+        suggestions_json = json.loads(clean_text, strict=False)
+        
+        state['suggestions'] = suggestions_json if isinstance(suggestions_json, list) else [suggestions_json]
+        state['status'] = "success"
+        state['error'] = ""
+    except json.JSONDecodeError as jde:
+        # Fallback if the LLM didn't return pure JSON or couldn't be parsed
+        state['suggestions'] = [{"section": "Parse Error", "original": None, "suggested": response_text, "reasoning": f"Could not parse structured JSON. Error: {str(jde)}"}]
+        state['status'] = "success"
+        state['error'] = ""
+    except Exception as e:
+        state['suggestions'] = []
+        state['status'] = "failed"
+        state['error'] = str(e)
+        
+    return state
+
+async def generate_cover_letter_node(state: AgentState) -> AgentState:
+    """
+    Node to generate a tailored cover letter payload.
+    """
+    prompt = f"""
+    You are an expert Career Coach and Executive Resume Writer.
+    
+    CANDIDATE PROFILE (Parsed Resume):
+    {state['parsed_markdown']}
+    
+    TARGET JOB DESCRIPTION:
+    {state['job_description']}
+    
+    TARGET COMPANY:
+    {state['company_name']}
+    
+    HIRING MANAGER:
+    {state['hiring_manager']}
+    
+    Task: Write a highly professional Cover Letter for this candidate. 
+    
+    RULES & FORMATTING:
+    1. Do not hallucinate skills. Use exactly what is found in the candidate profile.
+    2. Respond STRICTLY with a valid JSON object representing the cover letter pieces, matching this EXACT schema:
+       {{
+         "candidate_name": "Full Name",
+         "candidate_title": "Current or Target Title (e.g. Senior Engineer)",
+         "contact_info": "email | phone | location | linkedin (combine the ones you find)",
+         "greeting": "Dear [Hiring Manager Name/Hiring Manager] and the [Company Name] Hiring Team,",
+         "body_paragraphs": [
+           "Paragraph 1...",
+           "Paragraph 2...",
+           "Paragraph 3..."
+         ],
+         "sign_off": "Sincerely,\\n[Candidate Name]"
+       }}
+    3. Ensure no conversational fluff outside of the JSON block. THE ENTIRE BODY MUST BE EXTREMELY CONCISE (max 150-200 words). It MUST perfectly fit onto a single page without bleeding over.
+    4. Focus heavily on actionable impact. You MUST highlight key metrics, strong verbs, and main technologies by wrapping them in double asterisks (e.g., **decreased latency by 40%**). Ensure absolutely EVERY SINGLE paragraph has at least 2 or 3 of these bolded highlights. Do not leave any paragraph bare.
+    """
+    
+    try:
+        response_text = await call_sarvam_ai(prompt, temperature=0.6)
+        
+        # Clean JSON markdown if present
+        clean_text = str(response_text)
+        if "```json" in clean_text:
+            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_text:
+            clean_text = clean_text.split("```")[1].strip()
+            
+        start = clean_text.find('{')
+        end = clean_text.rfind('}')
+        if start != -1 and end != -1 and end >= start:
+            clean_text = clean_text[start:end+1]
+        else:
+            clean_text = clean_text.strip()
+            
+        cl_data = json.loads(clean_text, strict=False)
+        state['cover_letter_data'] = cl_data
+    except Exception as e:
+        state['cover_letter_data'] = {"error": f"Error generating cover letter: {str(e)}"}
+        
+    return state
+
+def should_generate_cover_letter(state: AgentState) -> str:
+    if state.get("company_name"):
+        return "cover_letter"
+    return END
+
+# Build the LangGraph Workflow
+workflow = StateGraph(AgentState)
+
+# Nodes
+workflow.add_node("analyze", analyze_node)
+workflow.add_node("cover_letter", generate_cover_letter_node)
+
+# Edges 
+workflow.add_edge(START, "analyze")
+workflow.add_conditional_edges("analyze", should_generate_cover_letter, {"cover_letter": "cover_letter", END: END})
+workflow.add_edge("cover_letter", END)
+
+# Compile LangGraph app
+agent_app = workflow.compile()
+
+async def run_agent(parsed_markdown: str, job_description: str, company_name: str = "", hiring_manager: str = ""):
+    """
+    Entrypoint function to run the compiled LangGraph agent.
+    """
+    hm = hiring_manager.strip() if hiring_manager.strip() else "Hiring Manager"
+    initial_state = AgentState(
+        parsed_markdown=parsed_markdown,
+        job_description=job_description,
+        company_name=company_name,
+        hiring_manager=hm,
+        cover_letter="",
+        cover_letter_data={},
+        suggestions=[],
+        status="started",
+        error=""
+    )
+    
+    final_state = await agent_app.ainvoke(initial_state)
+    return final_state
