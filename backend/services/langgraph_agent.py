@@ -77,9 +77,9 @@ async def call_sarvam_ai(prompt: str, temperature: float = 0.2) -> str:
                     extracted_text = val.get("text") if isinstance(val, dict) else str(val)
                 
             if not extracted_text:
-                print(f"[DEBUG - call_sarvam_ai] LLM returned empty extraction. Raw JSON: {json.dumps(data, indent=2)}")
+                pass  # LLM returned empty — handled by caller fallback logic
                 
-            return extracted_text 
+            return extracted_text
         except Exception as e:
             raise Exception(f"Failed to communicate with Sarvam AI: {str(e)}")
 
