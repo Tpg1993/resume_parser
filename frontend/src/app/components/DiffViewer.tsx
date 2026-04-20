@@ -17,6 +17,9 @@ export default function DiffViewer({ suggestions }: { suggestions: Suggestion[] 
                 <div key={idx} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow">
                     <div className="bg-gradient-to-r from-blue-50 to-indigo-50 px-5 py-3 border-b border-indigo-100 flex justify-between items-center">
                         <span className="font-semibold text-indigo-800">Section: {sug.section || 'General'}</span>
+                        <span className="px-2.5 py-1 bg-indigo-100 text-indigo-800 text-[10px] font-bold rounded-md uppercase tracking-wider">
+                            Targeted Update
+                        </span>
                     </div>
                     <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="bg-red-50/50 p-4 rounded-lg border border-red-100/50">

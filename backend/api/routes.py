@@ -126,7 +126,13 @@ async def upload_resume(
             "filename": resume.filename,
             "parsed_content": parsed_markdown,
             "suggestions": agent_result.get("suggestions", []),
+            "ats_score": agent_result.get("ats_score", 0),
+            "projected_score": agent_result.get("projected_score", 0),
+            "missing_keywords": agent_result.get("missing_keywords", []),
+            "match_tier": agent_result.get("match_tier", "Unknown"),
             "cover_letter_docx": cover_letter_docx
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+        import traceback
+        error_detail = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}\n\nTraceback:\n{error_detail}")

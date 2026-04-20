@@ -1,6 +1,7 @@
 'use client';
 import { useState } from 'react';
 import DiffViewer from './DiffViewer';
+import ATSScoreBanner from './ATSScoreBanner';
 
 export default function UploadSection() {
     const [file, setFile] = useState<File | null>(null);
@@ -146,6 +147,14 @@ export default function UploadSection() {
 
             {result && (
                 <div className="mt-8">
+                    {result.ats_score !== undefined && (
+                        <ATSScoreBanner 
+                            score={result.ats_score} 
+                            tier={result.match_tier} 
+                            missingKeywords={result.missing_keywords} 
+                            projectedScore={result.projected_score}
+                        />
+                    )}
                     <div className="flex justify-between items-center mb-6">
                         <h3 className="text-xl font-bold text-gray-800">Analysis Results</h3>
                         {result.cover_letter_docx && (

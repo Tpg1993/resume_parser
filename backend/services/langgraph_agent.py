@@ -1,7 +1,8 @@
 import os
 import json
 import httpx
-from typing import List, Dict, Any
+import asyncio
+from typing import List, Dict, Any, Optional
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
@@ -13,16 +14,23 @@ class AgentState(TypedDict):
     job_description: str
     company_name: str
     hiring_manager: str
+    
+    # New Fields
+    extracted_profile: dict
+    ats_score: int
+    missing_keywords: List[str]
+    match_tier: str
+    projected_score: int
+    
     cover_letter: str
     cover_letter_data: dict
     suggestions: List[Dict[str, Any]]
     status: str
     error: str
 
-async def call_sarvam_ai(prompt: str, temperature: float = 0.2) -> str:
+async def call_sarvam_ai(prompt: str, temperature: float = 0.2, retries: int = 3) -> str:
     """
-    Helper function to interface with Sarvam AI's LLM endpoints.
-    Adjust the URL and payload depending on the specific Sarvam AI model wrapper you use.
+    Helper function to interface with Sarvam AI's LLM endpoints with exponential backoff.
     """
     api_key = os.getenv("SARVAM_API_KEY")
     if not api_key or api_key == "your_sarvam_api_key_here":
@@ -36,111 +44,251 @@ async def call_sarvam_ai(prompt: str, temperature: float = 0.2) -> str:
         "Authorization": f"Bearer {api_key}" 
     }
     
+    model_name = os.getenv("SARVAM_MODEL", "sarvam-30b")
+    
     payload = {
-        "model": "sarvam-30b", 
+        "model": model_name, 
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": 4000
     }
     
     async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Robustly extract the generated text based on common LLM API schemas
-            extracted_text = None
-            if "choices" in data and len(data["choices"]) > 0:
-                choice = data["choices"][0]
-                if isinstance(choice, dict) and "message" in choice:
-                    msg = choice["message"]
-                    extracted_text = msg.get("content") or msg.get("text")
-                    if not extracted_text:
-                        # Fallback: grab any long string inside message
-                        for k, v in msg.items():
-                            if isinstance(v, str) and len(v) > 5 and k not in ["role"]:
-                                extracted_text = v
-                                break
-                elif isinstance(choice, dict) and "text" in choice:
-                    extracted_text = choice["text"]
-                elif isinstance(choice, str):
-                    extracted_text = choice
+        last_exception = None
+        for attempt in range(retries):
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Robustly extract the generated text based on common LLM API schemas
+                extracted_text = None
+                if "choices" in data and len(data["choices"]) > 0:
+                    choice = data["choices"][0]
+                    if isinstance(choice, dict) and "message" in choice:
+                        msg = choice["message"]
+                        extracted_text = msg.get("content") or msg.get("text")
+                        if not extracted_text:
+                            # Fallback: grab any long string inside message
+                            for k, v in msg.items():
+                                if isinstance(v, str) and len(v) > 5 and k not in ["role"]:
+                                    extracted_text = v
+                                    break
+                    elif isinstance(choice, dict) and "text" in choice:
+                        extracted_text = choice["text"]
+                    elif isinstance(choice, str):
+                        extracted_text = choice
+                        
+                if not extracted_text:
+                    if "output" in data:
+                        extracted_text = data["output"]
+                    elif "text" in data:
+                        extracted_text = data["text"]
+                    elif "results" in data and len(data["results"]) > 0:
+                        val = data["results"][0]
+                        extracted_text = val.get("text") if isinstance(val, dict) else str(val)
+                
+                if not extracted_text:
+                    pass  # LLM returned empty — handled by caller fallback logic
                     
-            if not extracted_text:
-                if "output" in data:
-                    extracted_text = data["output"]
-                elif "text" in data:
-                    extracted_text = data["text"]
-                elif "results" in data and len(data["results"]) > 0:
-                    val = data["results"][0]
-                    extracted_text = val.get("text") if isinstance(val, dict) else str(val)
+                return extracted_text
                 
-            if not extracted_text:
-                pass  # LLM returned empty — handled by caller fallback logic
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                # Retry on 429 Too Many Requests or 5xx Server Errors
+                if e.response.status_code in [429, 500, 502, 503, 504]:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                else:
+                    raise Exception(f"HTTP Error {e.response.status_code} communicating with Sarvam AI: {e.response.text}")
+            except Exception as e:
+                last_exception = e
+                await asyncio.sleep(2 ** attempt)
+                continue
                 
-            return extracted_text
-        except Exception as e:
-            raise Exception(f"Failed to communicate with Sarvam AI: {str(e)}")
+        raise Exception(f"Failed to communicate with Sarvam AI after {retries} attempts. Last error: {str(last_exception)}")
+
+def truncate_markdown(markdown: str, max_chars: int = 24000) -> str:
+    """Helper to ensure we don't blow the context window"""
+    if len(markdown) <= max_chars:
+        return markdown
+    # Brutal but effective truncation if it's too long, prioritizing the top
+    return markdown[:max_chars] + "\n\n... [TRUNCATED DUE TO LENGTH]"
+
+async def extract_profile_node(state: AgentState) -> AgentState:
+    """
+    Extracts a structured representation of the candidate from the raw markdown.
+    """
+    truncated_md = truncate_markdown(state['parsed_markdown'])
+    prompt = f"""
+    You are an expert Resume Parser. Your task is to accurately extract the candidate's professional profile from the following OCR/Parsed Markdown of their resume.
+
+    RAW RESUME MARKDOWN:
+    {truncated_md}
+
+    Extract the information into a strict JSON object with these exact keys:
+    - "name": Candidate's full name (or null if not found)
+    - "contact_info": Phone, email, location, linkedin (combine into one string)
+    - "summary": A brief professional summary based on the resume (max 2 sentences)
+    - "skills": A list of all skills found (strings)
+    - "experience": A list of job roles. Each should have "job_title", "company", "duration", and "responsibilities" (list of strings).
+    - "education": A list of degrees/institutions.
+
+    CRITICAL RULES:
+    1. Respond ONLY with valid JSON. Do not include markdown formatting like ```json or any other text.
+    2. Do NOT hallucinate. Only extract what is present.
+    """
+    try:
+        response_text = await call_sarvam_ai(prompt, temperature=0.1)
+        clean_text = str(response_text)
+        if "```json" in clean_text:
+            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_text:
+            clean_text = clean_text.split("```")[1].strip()
+            
+        start = clean_text.find('{')
+        end = clean_text.rfind('}')
+        if start != -1 and end != -1 and end >= start:
+            clean_text = clean_text[start:end+1]
+            
+        profile_data = json.loads(clean_text, strict=False)
+        state['extracted_profile'] = profile_data
+    except Exception as e:
+        # Graceful fallback: empty profile
+        state['extracted_profile'] = {"error": "Failed to extract profile", "details": str(e)}
+        
+    return state
+
+async def ats_score_node(state: AgentState) -> AgentState:
+    """
+    Generates an ATS score, missing keywords, and match tier based on the JD.
+    """
+    if not state.get('job_description'):
+        state['ats_score'] = 0
+        state['missing_keywords'] = []
+        state['match_tier'] = "Unknown"
+        return state
+
+    truncated_md = truncate_markdown(state['parsed_markdown'])
+    prompt = f"""
+    You are an expert ATS (Applicant Tracking System) Scanner.
+    
+    JOB DESCRIPTION:
+    {state['job_description']}
+    
+    CANDIDATE RESUME (EXTRACTED SKILLS & EXPERIENCE):
+    {json.dumps(state.get('extracted_profile', {}), indent=2)}
+    
+    (RAW RESUME FALLBACK):
+    {truncated_md[:5000]} 
+
+    Analyze the candidate's fit for the Job Description.
+    Respond EXACTLY with a JSON object matching this schema:
+    {{
+        "ats_score": number (0-100, representing match percentage),
+        "missing_keywords": [array of top 5-7 critical skills/keywords in the JD that are MISSING or weakly represented in the resume],
+        "match_tier": string ("Weak", "Fair", or "Strong" based on the score. Weak < 50, Fair 50-75, Strong > 75)
+    }}
+
+    Respond with ONLY the raw JSON.
+    """
+    try:
+        response_text = await call_sarvam_ai(prompt, temperature=0.1)
+        clean_text = str(response_text)
+        if "```json" in clean_text:
+            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_text:
+            clean_text = clean_text.split("```")[1].strip()
+            
+        start = clean_text.find('{')
+        end = clean_text.rfind('}')
+        if start != -1 and end != -1 and end >= start:
+            clean_text = clean_text[start:end+1]
+            
+        ats_data = json.loads(clean_text, strict=False)
+        state['ats_score'] = int(ats_data.get('ats_score', 0))
+        state['missing_keywords'] = ats_data.get('missing_keywords', [])
+        state['match_tier'] = ats_data.get('match_tier', "Unknown")
+    except Exception as e:
+        state['ats_score'] = 0
+        state['missing_keywords'] = ["Error calculating ATS score"]
+        state['match_tier'] = "Error"
+        
+    return state
 
 async def analyze_node(state: AgentState) -> AgentState:
     """
-    The main analysis node in our acyclic/cyclic graph.
+    The main analysis node that generates specific diff suggestions using the extracted context.
     """
+    missing_kw = ", ".join(state.get('missing_keywords', []))
+    
     prompt = f"""
     You are an expert ATS-friendly Resume Writer.
     
     JOB DESCRIPTION:
     {state['job_description']}
     
-    CURRENT RESUME (Markdown):
-    {state['parsed_markdown']}
+    EXTRACTED CANDIDATE PROFILE:
+    {json.dumps(state.get('extracted_profile', {}), indent=2)}
     
-    Suggest specific modifications to tailor this resume to the JD.
-    Output your suggestions strictly in a JSON list format where each object has:
-    - "section": The section of the resume (e.g. Experience, Skills)
-    - "original": The exact original text to replace (or null if new addition)
-    - "suggested": The proposed new text
-    - "reasoning": Why this change helps match the JD
+    ATS GAP ANALYSIS:
+    - Match Score: {state.get('ats_score', 0)}/100
+    - Missing Keywords to Add: {missing_kw}
+    
+    CURRENT RESUME (Markdown):
+    {truncate_markdown(state['parsed_markdown'])}
+    
+    Suggest specific modifications to tailor this resume to the JD. Focus HEAVILY on incorporating the missing keywords and addressing the ATS Gap Analysis.
+    Output your suggestions strictly in a JSON format matching this EXACT schema:
+    {{
+      "projected_score": number (0-100, estimating the NEW ATS score if all these suggestions are applied),
+      "suggestions": [
+        {{
+          "section": "The section of the resume (e.g. Experience, Skills, Summary)",
+          "original": "The exact original text to replace (or null if new addition). Make sure this text actually exists in the resume.",
+          "suggested": "The proposed new text. Include quantifiable metrics and the missing keywords where appropriate.",
+          "reasoning": "Why this change helps match the JD (mention specific keywords addressed)."
+        }}
+      ]
+    }}
     
     CRITICAL RULES:
-    1. Output strictly valid JSON.
-    2. Respond with ONLY the raw JSON list, starting with [ and ending with ].  
+    1. Output strictly valid JSON matching the schema above.
+    2. Respond with ONLY the raw JSON object, starting with {{ and ending with }}.  
     3. Do not place markdown blocks inside the JSON fields.
     4. Ensure string values avoid unescaped inline newlines when possible. Use \\n.
-    5. If the inputs lack clear sections or are arbitrary text, try your best to logically group them into a single recommendation or return a single JSON object explaining that no clear changes could be correlated.
-    6. MAXIMUM 5 SUGGESTIONS TOTAL. Be extremely concise. Do not exceed this limit under any circumstances.
+    5. Provide EXACTLY 1 to 5 suggestions. Prioritize the highest-impact changes.
+    6. Do NOT suggest any modifications or changes to the Education section whatsoever. Focus purely on Experience, Skills, and Summary.
     """
     
     try:
-        response_text = await call_sarvam_ai(prompt)
+        response_text = await call_sarvam_ai(prompt, temperature=0.3)
         
         if not response_text:
-            # Fallback instead of throwing an error so the frontend doesn't break
-            response_text = '[{"section": "API Issue", "original": null, "suggested": "No text generated by the AI.", "reasoning": "The AI model returned an empty response. This often happens if the input triggers a context size limit or safety filter."}]'
+            response_text = '[{"section": "API Issue", "original": null, "suggested": "No text generated by the AI.", "reasoning": "The AI model returned an empty response."}]'
             
-        # Clean response and try parsing JSON
         clean_text = str(response_text)
         if "```json" in clean_text:
             clean_text = clean_text.split("```json")[1].split("```")[0].strip()
         elif "```" in clean_text:
             clean_text = clean_text.split("```")[1].strip()
         
-        # Try to substring to '[' and ']' just in case there are conversational prefixes.
-        start = clean_text.find('[')
-        end = clean_text.rfind(']')
+        start = clean_text.find('{')
+        end = clean_text.rfind('}')
         if start != -1 and end != -1 and end > start:
             clean_text = clean_text[start:end+1]
         else:
             clean_text = clean_text.strip()
             
-        suggestions_json = json.loads(clean_text, strict=False)
+        parsed_json = json.loads(clean_text, strict=False)
+        
+        state['projected_score'] = parsed_json.get('projected_score', state.get('ats_score', 0))
+        suggestions_json = parsed_json.get('suggestions', [])
         
         state['suggestions'] = suggestions_json if isinstance(suggestions_json, list) else [suggestions_json]
         state['status'] = "success"
         state['error'] = ""
     except json.JSONDecodeError as jde:
-        # Fallback if the LLM didn't return pure JSON or couldn't be parsed
         state['suggestions'] = [{"section": "Parse Error", "original": None, "suggested": response_text, "reasoning": f"Could not parse structured JSON. Error: {str(jde)}"}]
         state['status'] = "success"
         state['error'] = ""
@@ -158,8 +306,8 @@ async def generate_cover_letter_node(state: AgentState) -> AgentState:
     prompt = f"""
     You are an expert Career Coach and Executive Resume Writer.
     
-    CANDIDATE PROFILE (Parsed Resume):
-    {state['parsed_markdown']}
+    CANDIDATE PROFILE (Extracted):
+    {json.dumps(state.get('extracted_profile', {}), indent=2)}
     
     TARGET JOB DESCRIPTION:
     {state['job_description']}
@@ -194,7 +342,6 @@ async def generate_cover_letter_node(state: AgentState) -> AgentState:
     try:
         response_text = await call_sarvam_ai(prompt, temperature=0.6)
         
-        # Clean JSON markdown if present
         clean_text = str(response_text)
         if "```json" in clean_text:
             clean_text = clean_text.split("```json")[1].split("```")[0].strip()
@@ -224,11 +371,15 @@ def should_generate_cover_letter(state: AgentState) -> str:
 workflow = StateGraph(AgentState)
 
 # Nodes
+workflow.add_node("extract_profile", extract_profile_node)
+workflow.add_node("ats_score", ats_score_node)
 workflow.add_node("analyze", analyze_node)
 workflow.add_node("cover_letter", generate_cover_letter_node)
 
 # Edges 
-workflow.add_edge(START, "analyze")
+workflow.add_edge(START, "extract_profile")
+workflow.add_edge("extract_profile", "ats_score")
+workflow.add_edge("ats_score", "analyze")
 workflow.add_conditional_edges("analyze", should_generate_cover_letter, {"cover_letter": "cover_letter", END: END})
 workflow.add_edge("cover_letter", END)
 
@@ -245,6 +396,11 @@ async def run_agent(parsed_markdown: str, job_description: str, company_name: st
         job_description=job_description,
         company_name=company_name,
         hiring_manager=hm,
+        extracted_profile={},
+        ats_score=0,
+        missing_keywords=[],
+        match_tier="",
+        projected_score=0,
         cover_letter="",
         cover_letter_data={},
         suggestions=[],

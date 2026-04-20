@@ -1,7 +1,14 @@
 import os
 import uuid
 import tempfile
+import re
 from docling.document_converter import DocumentConverter
+
+def clean_markdown(md_text: str) -> str:
+    """Removes excessive blank lines and caps length to prevent context explosion"""
+    # Replace 3 or more newlines with just 2
+    cleaned = re.sub(r'\n{3,}', '\n\n', md_text)
+    return cleaned
 
 def parse_pdf_from_buffer(content: bytes) -> str:
     """
@@ -21,7 +28,12 @@ def parse_pdf_from_buffer(content: bytes) -> str:
         # Convert PDF to structured document and export as markdown
         converter = DocumentConverter()
         result = converter.convert(temp_path)
-        return result.document.export_to_markdown()
+        md_content = result.document.export_to_markdown()
+        
+        if not md_content or not md_content.strip():
+            raise Exception("Parsed document is completely empty. The PDF might be scanned or unreadable by standard extraction.")
+            
+        return clean_markdown(md_content)
     finally:
         # Cleanup
         if os.path.exists(temp_path):
