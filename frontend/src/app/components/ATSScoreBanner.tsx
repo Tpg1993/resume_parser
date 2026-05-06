@@ -62,17 +62,17 @@ export default function ATSScoreBanner({ score = 0, tier = "Unknown", missingKey
                     </div>
 
                     {/* Arrow */}
-                    {projectedScore > 0 && projectedScore > score && (
+                    {projectedScore > 0 && (
                         <div className="hidden sm:flex flex-col items-center justify-center pt-4">
                             <svg className="w-8 h-8 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
                             </svg>
-                            <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider mt-1">Updates</span>
+                            <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider mt-1">After Edits</span>
                         </div>
                     )}
 
                     {/* Projected Score Circle */}
-                    {projectedScore > 0 && projectedScore > score && (
+                    {projectedScore > 0 && (
                         <div className="flex flex-col items-center gap-2">
                             <h4 className="text-sm font-bold text-green-700 text-center">After Edit Match</h4>
                             <div className="relative flex items-center justify-center w-24 h-24 rounded-full bg-white shadow-inner">

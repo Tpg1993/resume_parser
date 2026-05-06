@@ -218,85 +218,159 @@ async def ats_score_node(state: AgentState) -> AgentState:
 
 async def analyze_node(state: AgentState) -> AgentState:
     """
-    The main analysis node that generates specific diff suggestions using the extracted context.
+    The main analysis node that generates specific diff suggestions.
+    Uses a plain-text delimiter format (NOT JSON) to avoid all quote/escape parsing issues.
     """
+    import re as _re
+
     missing_kw = ", ".join(state.get('missing_keywords', []))
-    
+
     prompt = f"""
     You are an expert ATS-friendly Resume Writer.
-    
+
     JOB DESCRIPTION:
     {state['job_description']}
-    
+
     EXTRACTED CANDIDATE PROFILE:
     {json.dumps(state.get('extracted_profile', {}), indent=2)}
-    
+
     ATS GAP ANALYSIS:
     - Match Score: {state.get('ats_score', 0)}/100
     - Missing Keywords to Add: {missing_kw}
-    
+
     CURRENT RESUME (Markdown):
     {truncate_markdown(state['parsed_markdown'])}
-    
-    Suggest specific modifications to tailor this resume to the JD. Focus HEAVILY on incorporating the missing keywords and addressing the ATS Gap Analysis.
-    Output your suggestions strictly in a JSON format matching this EXACT schema:
-    {{
-      "projected_score": number (0-100, estimating the NEW ATS score if all these suggestions are applied),
-      "suggestions": [
-        {{
-          "section": "The section of the resume (e.g. Experience, Skills, Summary)",
-          "original": "The exact original text to replace (or null if new addition). Make sure this text actually exists in the resume.",
-          "suggested": "The proposed new text. Include quantifiable metrics and the missing keywords where appropriate.",
-          "reasoning": "Why this change helps match the JD (mention specific keywords addressed)."
-        }}
-      ]
-    }}
-    
-    CRITICAL RULES:
-    1. Output strictly valid JSON matching the schema above.
-    2. Respond with ONLY the raw JSON object, starting with {{ and ending with }}.  
-    3. Do not place markdown blocks inside the JSON fields.
-    4. Ensure string values avoid unescaped inline newlines when possible. Use \\n.
-    5. Provide EXACTLY 1 to 5 suggestions. Prioritize the highest-impact changes.
-    6. Do NOT suggest any modifications or changes to the Education section whatsoever. Focus purely on Experience, Skills, and Summary.
+
+    Suggest specific modifications to tailor this resume to the JD. Focus HEAVILY on incorporating the missing keywords.
+
+    OUTPUT FORMAT — Use EXACTLY this delimiter structure. Do NOT use JSON or markdown. Plain text only.
+
+    PROJECTED_SCORE: <integer 0-100>
+
+    [SUGGESTION]
+    SECTION: <Experience, Skills, or Summary>
+    ROLE: <exact job title if Experience section, else null>
+    COMPANY: <exact company name if Experience section, else null>
+    ORIGINAL_START
+    <The exact original text from the resume to replace. Write the word NULL if this is a brand new addition.>
+    ORIGINAL_END
+    SUGGESTED_START
+    <The complete replacement text with missing keywords and quantifiable metrics.>
+    SUGGESTED_END
+    REASONING_START
+    <Why this change improves the ATS match and which specific keywords it addresses.>
+    REASONING_END
+    [/SUGGESTION]
+
+    RULES:
+    1. Use EXACTLY the delimiters shown above. Do not rename or modify them.
+    2. Provide between 1 and 5 [SUGGESTION] blocks. Prioritize the highest-impact changes.
+    3. Do NOT touch the Education section. Focus only on Experience, Skills, and Summary.
+    4. Do not add any text outside of the PROJECTED_SCORE line and the [SUGGESTION] blocks.
     """
-    
+
+    def _parse_delimiter_response(text: str, fallback_score: int):
+        """Parse the custom delimiter format. Returns (proj_score, suggestions_list)."""
+        suggestions = []
+
+        score_m = _re.search(r'PROJECTED_SCORE\s*:\s*(\d+)', text)
+        proj_score = int(score_m.group(1)) if score_m else fallback_score
+
+        blocks = _re.findall(r'\[SUGGESTION\](.*?)\[/SUGGESTION\]', text, _re.DOTALL)
+        for block in blocks:
+            # Single-line fields: do NOT use DOTALL so .+ stops at newline
+            def _line(pattern, b=block):
+                m = _re.search(pattern, b)
+                return m.group(1).strip() if m else None
+
+            # Multi-line block fields: use DOTALL to capture across newlines
+            def _block(pattern, b=block):
+                m = _re.search(pattern, b, _re.DOTALL)
+                return m.group(1).strip() if m else None
+
+            def _null_or(val):
+                if val is None:
+                    return None
+                return None if val.strip().lower() in ('null', 'none', '') else val.strip()
+
+            suggestions.append({
+                "section":   _line(r'SECTION\s*:\s*([^\n]+)') or 'General',
+                "role":      _null_or(_line(r'ROLE\s*:\s*([^\n]+)')),
+                "company":   _null_or(_line(r'COMPANY\s*:\s*([^\n]+)')),
+                "original":  _null_or(_block(r'ORIGINAL_START\s*(.*?)\s*ORIGINAL_END')),
+                "suggested": _block(r'SUGGESTED_START\s*(.*?)\s*SUGGESTED_END'),
+                "reasoning": _block(r'REASONING_START\s*(.*?)\s*REASONING_END'),
+            })
+
+        return proj_score, suggestions
+
     try:
         response_text = await call_sarvam_ai(prompt, temperature=0.3)
-        
+
         if not response_text:
-            response_text = '[{"section": "API Issue", "original": null, "suggested": "No text generated by the AI.", "reasoning": "The AI model returned an empty response."}]'
-            
-        clean_text = str(response_text)
-        if "```json" in clean_text:
-            clean_text = clean_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_text:
-            clean_text = clean_text.split("```")[1].strip()
-        
-        start = clean_text.find('{')
-        end = clean_text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            clean_text = clean_text[start:end+1]
-        else:
-            clean_text = clean_text.strip()
-            
-        parsed_json = json.loads(clean_text, strict=False)
-        
-        state['projected_score'] = parsed_json.get('projected_score', state.get('ats_score', 0))
-        suggestions_json = parsed_json.get('suggestions', [])
-        
-        state['suggestions'] = suggestions_json if isinstance(suggestions_json, list) else [suggestions_json]
+            state['suggestions'] = [{
+                "section": "API Issue", "role": None, "company": None,
+                "original": None, "suggested": "No text generated by the AI.",
+                "reasoning": "The AI returned an empty response."
+            }]
+            state['projected_score'] = state.get('ats_score', 0)
+            state['status'] = "success"
+            state['error'] = ""
+            return state
+
+        text = str(response_text)
+
+        # --- Primary: delimiter-based parse ---
+        proj_score, suggestions = _parse_delimiter_response(text, state.get('ats_score', 0))
+
+        # --- Fallback: if LLM ignored instructions and returned JSON, try JSON parse ---
+        if not suggestions:
+            try:
+                clean = _re.sub(r'```(?:json)?\s*', '', text).strip()
+                s = clean.find('{')
+                e = clean.rfind('}')
+                if s != -1 and e > s:
+                    clean = clean[s:e+1]
+                parsed = None
+                try:
+                    parsed = json.loads(clean, strict=False)
+                except Exception:
+                    try:
+                        from json_repair import repair_json
+                        r = repair_json(clean, return_objects=True)
+                        if isinstance(r, dict):
+                            parsed = r
+                    except Exception:
+                        pass
+                if parsed and parsed.get('suggestions'):
+                    proj_score = int(parsed.get('projected_score', proj_score))
+                    suggestions = parsed['suggestions']
+            except Exception:
+                pass
+
+        if not suggestions:
+            raise ValueError(
+                f"Could not extract any suggestions from LLM response. "
+                f"Raw (first 400 chars): {text[:400]}"
+            )
+
+        state['projected_score'] = proj_score
+        state['suggestions'] = suggestions
         state['status'] = "success"
         state['error'] = ""
-    except json.JSONDecodeError as jde:
-        state['suggestions'] = [{"section": "Parse Error", "original": None, "suggested": response_text, "reasoning": f"Could not parse structured JSON. Error: {str(jde)}"}]
-        state['status'] = "success"
-        state['error'] = ""
+
     except Exception as e:
-        state['suggestions'] = []
-        state['status'] = "failed"
-        state['error'] = str(e)
-        
+        state['suggestions'] = [{
+            "section":   "Processing Note",
+            "role":      None,
+            "company":   None,
+            "original":  None,
+            "suggested": "The AI returned suggestions but could not be parsed. Please try again.",
+            "reasoning": f"Parse error: {str(e)}"
+        }]
+        state['status'] = "success"
+        state['error'] = ""
+
     return state
 
 async def generate_cover_letter_node(state: AgentState) -> AgentState:

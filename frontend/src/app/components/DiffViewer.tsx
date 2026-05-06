@@ -2,6 +2,8 @@ import React from 'react';
 
 interface Suggestion {
     section?: string;
+    role?: string | null;
+    company?: string | null;
     original?: string | null;
     suggested?: string;
     reasoning?: string;
@@ -16,7 +18,14 @@ export default function DiffViewer({ suggestions }: { suggestions: Suggestion[] 
             {suggestions.map((sug, idx) => (
                 <div key={idx} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow">
                     <div className="bg-gradient-to-r from-blue-50 to-indigo-50 px-5 py-3 border-b border-indigo-100 flex justify-between items-center">
-                        <span className="font-semibold text-indigo-800">Section: {sug.section || 'General'}</span>
+                        <div className="flex flex-col gap-0.5">
+                            <span className="font-semibold text-indigo-800">Section: {sug.section || 'General'}</span>
+                            {(sug.role || sug.company) && (
+                                <span className="text-xs text-indigo-600 font-medium">
+                                    {[sug.role, sug.company].filter(Boolean).join(' · ')}
+                                </span>
+                            )}
+                        </div>
                         <span className="px-2.5 py-1 bg-indigo-100 text-indigo-800 text-[10px] font-bold rounded-md uppercase tracking-wider">
                             Targeted Update
                         </span>
