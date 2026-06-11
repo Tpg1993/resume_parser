@@ -36,7 +36,7 @@ export default function UploadSection() {
         }
 
         try {
-            const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+            const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
             const response = await fetch(`${apiUrl}/api/upload`, {
                 method: 'POST',
                 body: formData,
