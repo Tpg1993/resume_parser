@@ -195,7 +195,7 @@ async def run_flowcv_sync(jd_text: str):
             print("Proceeding to launch browser profile...")
             
             # Layer 2: Launch actual Chrome profile (works if Chrome is closed)
-            local_appdata = os.getenv("LOCALAPPDATA", r"C:\Users\Tejas\AppData\Local")
+            local_appdata = os.getenv("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
             actual_chrome_profile = os.path.join(local_appdata, r"Google\Chrome\User Data")
             try:
                 print(f"Attempting to launch your actual Google Chrome profile at: {actual_chrome_profile}")
