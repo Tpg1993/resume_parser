@@ -115,6 +115,94 @@ def truncate_markdown(markdown: str, max_chars: int = 24000) -> str:
     # Brutal but effective truncation if it's too long, prioritizing the top
     return markdown[:max_chars] + "\n\n... [TRUNCATED DUE TO LENGTH]"
 
+import re
+
+def is_placeholder(val: Any, field_type: str = "name") -> bool:
+    if not val or not isinstance(val, str):
+        return True
+    val_clean = val.strip().lower()
+    if not val_clean or val_clean in {"none", "null", "n/a", "unknown", "candidate", "name"}:
+        return True
+    if field_type == "name":
+        placeholders = {
+            "full name", "candidate name", "candidate's name", "your name", "candidate", 
+            "john doe", "jane doe", "[candidate name]", "[full name]", "[name]", "<name>"
+        }
+        if val_clean in placeholders or "candidate name" in val_clean or "full name" in val_clean:
+            return True
+    elif field_type == "contact":
+        placeholders = {
+            "email | phone", "contact info", "contact details", "[contact info]",
+            "email | phone | location", "email | phone | location | linkedin",
+            "your contact", "<contact info>", "[email | phone]"
+        }
+        if val_clean in placeholders or "email | phone" in val_clean or "contact info" in val_clean:
+            return True
+    return False
+
+def extract_candidate_info_from_markdown(md_text: str) -> dict:
+    if not md_text:
+        return {'name': None, 'contact_info': None}
+        
+    lines = [l.strip() for l in md_text.split('\n') if l.strip()]
+    top_lines = lines[:20]
+    
+    # 1. Emails
+    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', md_text)
+    
+    # 2. Phones
+    phones = re.findall(r'\(?\+?\d{1,3}\)?[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}', md_text)
+    
+    # 3. LinkedIn
+    linkedins = re.findall(r'(?:https?://)?(?:www\.)?linkedin\.com/in/[\w-]+', md_text, re.IGNORECASE)
+    
+    # 4. Locations (look at individual lines or line segments)
+    locations = []
+    for line in top_lines:
+        for segment in re.split(r'[\|\:\-•]', line):
+            seg = segment.strip()
+            if re.match(r'^[A-Z][a-zA-Z\s]{1,30},\s*(?:[A-Z]{2}|[A-Z][a-zA-Z\s]{1,20})$', seg):
+                locations.append(seg)
+
+    candidate_name = None
+    ignore_words = {'resume', 'curriculum', 'vitae', 'summary', 'experience', 'education', 'skills', 'profile', 'work', 'history', 'projects', 'contact', 'overview', 'page'}
+    
+    for line in top_lines:
+        clean_line = re.sub(r'^[#*_\-\s]+', '', line).strip()
+        words = clean_line.lower().split()
+        if not words:
+            continue
+        if set(words) & ignore_words:
+            continue
+        if re.search(r'@|http|\.com|\.org|\d{5}', clean_line):
+            continue
+            
+        parts = re.split(r'[\|\:\-•,]', clean_line)
+        possible_name = parts[0].strip()
+        
+        name_words = possible_name.split()
+        if 1 <= len(name_words) <= 4 and all(w.replace('.', '').replace("'", '').replace('-', '').isalpha() for w in name_words):
+            if possible_name.lower() not in ignore_words and len(possible_name) > 1:
+                candidate_name = possible_name
+                break
+
+    contact_parts = []
+    if emails:
+        contact_parts.append(emails[0])
+    if phones:
+        contact_parts.append(phones[0])
+    if locations:
+        loc = locations[0].strip()
+        if not emails or loc.lower() not in emails[0].lower():
+            contact_parts.append(loc)
+    if linkedins:
+        contact_parts.append(linkedins[0])
+
+    return {
+        'name': candidate_name,
+        'contact_info': ' | '.join(contact_parts) if contact_parts else None
+    }
+
 async def extract_profile_node(state: AgentState) -> AgentState:
     """
     Extracts a structured representation of the candidate from the raw markdown.
@@ -127,8 +215,8 @@ async def extract_profile_node(state: AgentState) -> AgentState:
     {truncated_md}
 
     Extract the information into a strict JSON object with these exact keys:
-    - "name": Candidate's full name (or null if not found)
-    - "contact_info": Phone, email, location, linkedin (combine into one string)
+    - "name": Candidate's full name (extract the real name from the resume header, NOT a placeholder)
+    - "contact_info": Phone, email, location, linkedin (combine the real details into one string)
     - "summary": A brief professional summary based on the resume (max 2 sentences)
     - "skills": A list of all skills found (strings)
     - "experience": A list of job roles. Each should have "job_title", "company", "duration", and "responsibilities" (list of strings).
@@ -136,7 +224,7 @@ async def extract_profile_node(state: AgentState) -> AgentState:
 
     CRITICAL RULES:
     1. Respond ONLY with valid JSON. Do not include markdown formatting like ```json or any other text.
-    2. Do NOT hallucinate. Only extract what is present.
+    2. Do NOT hallucinate or output placeholder values like 'Full Name' or 'Candidate Name'. Extract the actual text from the top of the resume.
     """
     try:
         response_text = await call_sarvam_ai(prompt, temperature=0.1)
@@ -156,7 +244,20 @@ async def extract_profile_node(state: AgentState) -> AgentState:
     except Exception as e:
         # Graceful fallback: empty profile
         state['extracted_profile'] = {"error": "Failed to extract profile", "details": str(e)}
-        
+
+    # Verify candidate name and contact info with python fallback extraction
+    fallback = extract_candidate_info_from_markdown(state['parsed_markdown'])
+    
+    current_name = state['extracted_profile'].get('name')
+    if is_placeholder(current_name, "name"):
+        if fallback.get('name'):
+            state['extracted_profile']['name'] = fallback['name']
+
+    current_contact = state['extracted_profile'].get('contact_info')
+    if is_placeholder(current_contact, "contact"):
+        if fallback.get('contact_info'):
+            state['extracted_profile']['contact_info'] = fallback['contact_info']
+
     return state
 
 async def ats_score_node(state: AgentState) -> AgentState:
@@ -377,44 +478,69 @@ async def generate_cover_letter_node(state: AgentState) -> AgentState:
     """
     Node to generate a tailored cover letter payload.
     """
+    profile = state.get('extracted_profile', {})
+    fallback_info = extract_candidate_info_from_markdown(state.get('parsed_markdown', ''))
+    
+    cand_name = profile.get('name')
+    if is_placeholder(cand_name, "name"):
+        cand_name = fallback_info.get('name') or "Candidate Name"
+        
+    cand_contact = profile.get('contact_info')
+    if is_placeholder(cand_contact, "contact"):
+        cand_contact = fallback_info.get('contact_info') or ""
+
+    header_text = truncate_markdown(state.get('parsed_markdown', ''))[:3000]
+
+    hm_val = (state.get('hiring_manager') or '').strip()
+    comp_val = (state.get('company_name') or '').strip()
+    
+    greeting_guidance = f"Dear {hm_val} and the {comp_val} Hiring Team," if (hm_val and hm_val.lower() != 'hiring manager') else (f"Dear {comp_val} Hiring Team," if comp_val else "Dear Hiring Manager,")
+
     prompt = f"""
-    You are an expert Career Coach and Executive Resume Writer.
+    You are an expert Executive Resume Writer and Career Coach.
+    
+    CANDIDATE NAME: {cand_name}
+    CANDIDATE CONTACT DETAILS: {cand_contact}
+    
+    RAW RESUME HEADER:
+    {header_text}
     
     CANDIDATE PROFILE (Extracted):
-    {json.dumps(state.get('extracted_profile', {}), indent=2)}
+    {json.dumps(profile, indent=2)}
     
     TARGET JOB DESCRIPTION:
     {state['job_description']}
     
     TARGET COMPANY:
-    {state['company_name']}
+    {comp_val}
     
     HIRING MANAGER:
-    {state['hiring_manager']}
+    {hm_val}
     
-    Task: Write a highly professional Cover Letter for this candidate. 
+    Task: Author a compelling, executive-level Cover Letter tailored specifically to this candidate and job. 
     
     RULES & FORMATTING:
-    1. Do not hallucinate skills. Use exactly what is found in the candidate profile.
-    2. Respond STRICTLY with a valid JSON object representing the cover letter pieces, matching this EXACT schema:
+    1. Do not hallucinate. Rely strictly on facts and skills in the candidate profile.
+    2. Respond STRICTLY with a valid JSON object matching this EXACT schema:
        {{
-         "candidate_name": "Full Name",
-         "candidate_title": "Current or Target Title (e.g. Senior Engineer)",
-         "contact_info": "email | phone | location | linkedin (combine the ones you find)",
-         "greeting": "Dear [Hiring Manager Name/Hiring Manager] and the [Company Name] Hiring Team,",
+         "candidate_name": "{cand_name}",
+         "candidate_title": "Current or Target Professional Title",
+         "contact_info": "{cand_contact}",
+         "greeting": "{greeting_guidance}",
          "body_paragraphs": [
-           "Paragraph 1...",
-           "Paragraph 2...",
-           "Paragraph 3..."
+           "Paragraph 1 (Opening motivation & alignment with company mission)...",
+           "Paragraph 2 (Key achievements, core metrics, and domain leadership)...",
+           "Paragraph 3 (Technical stack alignment & value delivery)..."
          ],
-         "sign_off": "Sincerely,\\n[Candidate Name]"
+         "sign_off": "Sincerely,\\n{cand_name}"
        }}
-    3. Ensure no conversational fluff outside of the JSON block. THE ENTIRE BODY MUST BE EXTREMELY CONCISE (max 150-200 words). It MUST perfectly fit onto a single page without bleeding over.
-    4. Focus heavily on actionable impact. You MUST highlight key metrics, strong verbs, and main technologies by wrapping them in double asterisks (e.g., **decreased latency by 40%**). Ensure absolutely EVERY SINGLE paragraph has at least 2 or 3 of these bolded highlights. Do not leave any paragraph bare.
+    3. CRITICAL REQUIREMENT FOR CANDIDATE DETAILS: Use the exact candidate name '{cand_name}' and contact info '{cand_contact}'. DO NOT output placeholders like 'Full Name' or 'Candidate Name' or 'email | phone'.
+    4. Total body text must be 150-200 words max so it fits elegantly on 1 page.
+    5. MANDATORY METRIC & KEYWORD BOLDING: You MUST format key achievements, quantitative metrics (e.g. **7+ years**, **40% efficiency boost**), and core tech stack names (e.g. **Python**, **LangGraph**, **Azure**) using double asterisks `**...**`. EVERY paragraph MUST contain at least 2 to 4 bolded elements.
     """
     
     try:
-        response_text = await call_sarvam_ai(prompt, temperature=0.6)
+        response_text = await call_sarvam_ai(prompt, temperature=0.5)
         
         clean_text = str(response_text)
         if "```json" in clean_text:
@@ -430,6 +556,18 @@ async def generate_cover_letter_node(state: AgentState) -> AgentState:
             clean_text = clean_text.strip()
             
         cl_data = json.loads(clean_text, strict=False)
+        
+        # Post-process & guarantee candidate name and contact info are NEVER placeholder/blank
+        if is_placeholder(cl_data.get("candidate_name"), "name"):
+            cl_data["candidate_name"] = cand_name
+            
+        if is_placeholder(cl_data.get("contact_info"), "contact"):
+            cl_data["contact_info"] = cand_contact
+            
+        sign_off = cl_data.get("sign_off", "")
+        if not sign_off or is_placeholder(sign_off, "name") or "[Candidate Name]" in sign_off or "[Candidate Full Name]" in sign_off or "[Full Name]" in sign_off:
+            cl_data["sign_off"] = f"Sincerely,\n{cl_data['candidate_name']}"
+            
         state['cover_letter_data'] = cl_data
     except Exception as e:
         state['cover_letter_data'] = {"error": f"Error generating cover letter: {str(e)}"}
@@ -437,9 +575,7 @@ async def generate_cover_letter_node(state: AgentState) -> AgentState:
     return state
 
 def should_generate_cover_letter(state: AgentState) -> str:
-    if state.get("company_name"):
-        return "cover_letter"
-    return END
+    return "cover_letter"
 
 # Build the LangGraph Workflow
 workflow = StateGraph(AgentState)

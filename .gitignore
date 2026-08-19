@@ -34,3 +34,6 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+
+# Browser profiles
+.flowcv_profile/
